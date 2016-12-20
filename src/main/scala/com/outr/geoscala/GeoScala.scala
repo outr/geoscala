@@ -1,99 +1,253 @@
 package com.outr.geoscala
 
-import java.io.{File, FileOutputStream}
+import java.io.File
 import java.net.{HttpURLConnection, URL}
+import java.nio.file.attribute.FileTime
 import java.nio.file.{Files, Path, Paths, StandardCopyOption}
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import java.util.zip.{ZipEntry, ZipFile}
 
 import com.outr.lucene4s._
 import com.outr.lucene4s.facet.FacetField
 import com.outr.lucene4s.field.Field
 import com.outr.lucene4s.field.value.SpatialPoint
-import com.outr.lucene4s.query.Condition
+import com.outr.lucene4s.keyword.KeywordIndexing
+import com.outr.lucene4s.mapper.Searchable
+import com.outr.lucene4s.query.{Condition, QueryBuilder, SearchTerm}
 import com.outr.scribe.Logging
 
 import scala.concurrent.{Await, Future}
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.collection.JavaConverters._
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration._
 import scala.util.matching.Regex
 
-class GeoScala(cacheDirectory: Path, indexDirectory: Option[Path] = None) extends Logging {
-  private val lucene = new Lucene(indexDirectory, defaultFullTextSearchable = true)
+class GeoScala(cacheDirectory: Path = Paths.get("cache"),
+               indexDirectory: Path = Paths.get("index"),
+               minimumUpdateAge: FiniteDuration = 30.days) extends Logging {
+  private val postalIndex = new Lucene(Some(indexDirectory.resolve("postal")), defaultFullTextSearchable = true)
+  private val cityIndex = new Lucene(Some(indexDirectory.resolve("city")), defaultFullTextSearchable = true)
 
-  val countryCode: Field[String] = lucene.create.field[String]("countryCode")
-  val postalCode: Field[String] = lucene.create.field[String]("postCode")
-  val name: Field[String] = lucene.create.field[String]("name")
-  val stateName: Field[String] = lucene.create.field[String]("stateName")
-  val stateCode: Field[String] = lucene.create.field[String]("stateCode")
-  val provinceName: Field[String] = lucene.create.field[String]("provinceName")
-  val provinceCode: Field[String] = lucene.create.field[String]("provinceCode")
-  val communityName: Field[String] = lucene.create.field[String]("communityName")
-  val communityCode: Field[String] = lucene.create.field[String]("communityCode")
-  val location: Field[SpatialPoint] = lucene.create.field[SpatialPoint]("location")
-  val accuracy: Field[Int] = lucene.create.field[Int]("accuracy")
-  val locationFacet: FacetField = lucene.create.facet("locationFacet", hierarchical = true)
+  val postalLocation: SearchablePostalLocation = postalIndex.create.searchable[SearchablePostalLocation]
+  val location: SearchableLocation = cityIndex.create.searchable[SearchableLocation]
 
+  val countryIndexing = new KeywordIndexing(postalIndex, "countryIndex", KeywordIndexing.FieldFromBuilder(location.countryCode))
+  val nameIndexing = new KeywordIndexing(postalIndex, "nameIndex", KeywordIndexing.FieldFromBuilder(location.name), List(location.countryCode))
+  val stateIndexing = new KeywordIndexing(postalIndex, "stateIndex", KeywordIndexing.FieldFromBuilder(location.stateName), List(location.countryCode))
+  val provinceIndexing = new KeywordIndexing(postalIndex, "provinceIndex", KeywordIndexing.FieldFromBuilder(location.provinceName), List(location.countryCode))
+  val communityIndexing = new KeywordIndexing(postalIndex, "communityIndex", KeywordIndexing.FieldFromBuilder(location.communityName), List(location.countryCode))
 
-//  def isReady: Boolean
-//  def search(text: String, limit: Int = 10): List[Location]
+  private val updating = new AtomicReference[Future[Unit]](updateCache())
+  private var ready: Boolean = false
+
+  def future: Future[Unit] = updating.get()
+  def isReady: Boolean = ready
 
   /**
     * Updates the GeoNames file and updates the index with the data
     */
-  def updateCache(): Future[Unit] = Future {
-    // Determine currently cached date
-    val cacheZIP = cacheDirectory.resolve("allCountries.zip")
-    val cacheLastModified = if (Files.exists(cacheZIP)) Files.getLastModifiedTime(cacheZIP).toMillis else 0L
+  def requestUpdate(force: Boolean = false): Boolean = synchronized {
+    if (updating.get().isCompleted) {
+      updateCache(force)
+      true
+    } else {
+      false
+    }
+  }
 
-    // Determine if there is a newer file available
-    val geoNamesLastModified = {
-      val connection = GeoScala.AllCountriesURL.openConnection().asInstanceOf[HttpURLConnection]
-      try {
-        connection.getLastModified
-      } finally {
-        connection.disconnect()
+  object search {
+    def postal(code: String, countryCode: Option[String] = None): QueryBuilder[PostalLocation] = {
+      val searchTerm = countryCode match {
+        case Some(cc) => grouped(
+          exact(postalLocation.countryCode(cc)) -> Condition.Must,
+          exact(postalLocation.postalCode(code)) -> Condition.Must
+        )
+        case None => exact(postalLocation.postalCode(code))
+      }
+      postalLocation
+        .query()
+        .filter(searchTerm)
+    }
+    def address(text: String, countryCode: Option[String] = None): QueryBuilder[Location] = {
+      val queryText: String = text.split(Array(' ', ',', '.')).collect {
+        case s if s.trim.nonEmpty => s"+($s*^4 OR $s~0.8)"
+      }.mkString(" ")
+      val searchTerm = countryCode match {
+        case Some(cc) => grouped(
+          exact(location.countryCode(cc)) -> Condition.Must,
+          parse(queryText) -> Condition.Must
+        )
+        case None => parse(queryText)
+      }
+      location
+        .query()
+        .filter(searchTerm)
+    }
+  }
+
+  private def updateCache(force: Boolean = false): Future[Unit] = {
+    val f = Future {
+      // Create cache directory if it doesn't exist
+      if (!Files.isDirectory(cacheDirectory)) {
+        Files.createDirectories(cacheDirectory)
+      }
+
+      // Determine currently cached date
+      val cacheZIP = cacheDirectory.resolve("allCountries.zip")
+      val cacheLastModified = if (Files.exists(cacheZIP)) Files.getLastModifiedTime(cacheZIP).toMillis else 0L
+
+      // Determine if there is a newer file available
+      val geoNamesLastModified = {
+        val connection = GeoScala.AllCountriesURL.openConnection().asInstanceOf[HttpURLConnection]
+        try {
+          connection.getLastModified
+        } finally {
+          connection.disconnect()
+        }
+      }
+
+      // Download latest GeoNames file if newer exists
+      val expiredCache = cacheLastModified + minimumUpdateAge.toMillis < geoNamesLastModified
+      if (expiredCache || force) {
+        logger.info(s"Modified Since Last Updated. GeoNames: $geoNamesLastModified, Cached: $cacheLastModified, Minimum Update Age: $minimumUpdateAge.")
+        val input = GeoScala.AllCountriesURL.openStream()
+        try {
+          Files.copy(input, cacheZIP, StandardCopyOption.REPLACE_EXISTING)
+          Files.setLastModifiedTime(cacheZIP, FileTime.fromMillis(geoNamesLastModified))
+        } finally {
+          input.close()
+        }
+
+        // Extract GeoNames ZIP
+        logger.info(s"Extracting $cacheZIP...")
+        UberZip.unzip(cacheZIP.toFile, cacheDirectory.toFile, 8)
+
+        // Clear index
+        logger.info("Removing all records before importing...")
+        postalIndex.deleteAll()
+        cityIndex.deleteAll()
+
+        // Import and update index
+        logger.info("Importing lines from allCountries.txt...")
+        val cacheText = cacheDirectory.resolve("allCountries.txt")
+        val lineCount = {
+          val stream = Files.lines(cacheText)
+          try {
+            stream.count()
+          } finally {
+            stream.close()
+          }
+        }
+        val lines = Files.lines(cacheText)
+        var lastLog = System.currentTimeMillis()
+        lines.parallel().iterator().asScala.zipWithIndex.foreach {
+          case (line@GeoScala.LineRegex(cc, pc, pn, an1, ac1, an2, ac2, an3, ac3, lat, lon, acc), index) => try {
+            logger.debug(s"cc: $cc, pc: $pc, pn: $pn, an1: $an1, an2: $an2, an3: $an3, lat: $lat, lon: $lon, acc: $acc")
+            val l = SpatialPoint(lat.toDouble, lon.toDouble)
+            val locationPath = List(cc, an3, an2, an1, pn).filterNot(_.isEmpty)
+
+            val time = System.currentTimeMillis()
+            if (lastLog + 5000L < time) {
+              logger.info(s"Processing $index of $lineCount")
+              lastLog = time
+            }
+
+            // Postal index
+            val pl = PostalLocation(
+              countryCode = cc,
+              postalCode = pc,
+              name = pn,
+              stateName = an1,
+              stateCode = ac1,
+              provinceName = an2,
+              provinceCode = ac2,
+              communityName = an3,
+              communityCode = ac3,
+              point = l,
+              accuracy = if (acc.nonEmpty) acc.toInt else 0
+            )
+            postalLocation
+              .insert(pl)
+              .facets(postalLocation.locationFacet(locationPath: _*))
+              .index()
+
+            // Name index
+            val cl = Location(
+              countryCode = cc,
+              name = pn,
+              stateName = an1,
+              stateCode = ac1,
+              provinceName = an2,
+              provinceCode = ac2,
+              communityName = an3,
+              communityCode = ac3,
+              point = l,
+              accuracy = if (acc.nonEmpty) acc.toInt else 0
+            )
+            location
+              .update(cl)
+              .facets(location.locationFacet(locationPath: _*))
+              .index()
+          } catch {
+            case t: Throwable => throw new RuntimeException(s"Failed to process line: $line! (lat: $lat, lon: $lon)", t)
+          }
+        }
+        lines.close()
+
+        // Commit the index changes
+        logger.info("Committing changes...")
+        postalIndex.commit()
+        cityIndex.commit()
+
+        // Delete the TXT file
+        logger.info("Deleting allCountries.txt...")
+        Files.delete(cacheText)
+
+        logger.info("Update complete")
       }
     }
 
-    // Download latest GeoNames file if newer exists
-    if (geoNamesLastModified > cacheLastModified) {
-      logger.info(s"Modified Since Last Updated. GeoNames: $geoNamesLastModified, Cached: $cacheLastModified.")
-      val input = GeoScala.AllCountriesURL.openStream()
-      try {
-        Files.copy(input, cacheZIP)
-      } finally {
-        input.close()
-      }
+    f.foreach { u =>
+      ready = true
     }
+    f
+  }
 
-    // Extract GeoNames ZIP
-    logger.info(s"Extracting $cacheZIP...")
-    UberZip.unzip(cacheZIP.toFile, cacheDirectory.toFile, 8)
+  trait SearchableBase {
+    def countryCode: Field[String]
+    def name: Field[String]
+    def stateName: Field[String]
+    def stateCode: Field[String]
+    def provinceName: Field[String]
+    def provinceCode: Field[String]
+    def communityName: Field[String]
+    def communityCode: Field[String]
+    def point: Field[SpatialPoint]
+    def accuracy: Field[Int]
+  }
 
-    // Import and update index
-    val cacheText = cacheDirectory.resolve("allCountries.txt")
-    val lines = Files.lines(cacheText)
-    lines.iterator().asScala.foreach {
-      case line@GeoScala.LineRegex(cc, pc, pn, an1, ac1, an2, ac2, an3, ac3, lat, lon, acc) => try {
-        logger.debug(s"cc: $cc, pc: $pc, pn: $pn, an1: $an1, an2: $an2, an3: $an3, lat: $lat, lon: $lon, acc: $acc")
-        val l = SpatialPoint(lat.toDouble, lon.toDouble)
-        val locationPath = List(cc, an3, an2, an1, pn).filterNot(_.isEmpty)
-        lucene
-          .update(grouped(exact(countryCode(cc)) -> Condition.Must, exact(postalCode(pc)) -> Condition.Must))
-          .fields(
-            countryCode(cc), postalCode(pc), name(pn), stateName(an1), stateCode(ac1), provinceName(an2),
-            provinceCode(ac2), communityName(an3), communityCode(ac3), location(l), accuracy(if (acc.nonEmpty) acc.toInt else 0)
-          )
-          .facets(locationFacet(locationPath: _*))
-          .index()
-      } catch {
-        case t: Throwable => throw new RuntimeException(s"Failed to process line: $line! (lat: $lat, lon: $lon)", t)
-      }
-    }
-    lines.close()
+  trait SearchablePostalLocation extends Searchable[PostalLocation] with SearchableBase {
+    override def idSearchTerms(t: PostalLocation): List[SearchTerm] = List(
+      exact(countryCode(t.countryCode)),
+      exact(postalCode(t.postalCode))
+    )
+
+    def postalCode: Field[String]
+
+    val locationFacet: FacetField = postalIndex.create.facet("locationFacet", hierarchical = true)
+  }
+
+  trait SearchableLocation extends Searchable[Location] with SearchableBase {
+    override def idSearchTerms(t: Location): List[SearchTerm] = List(
+      exact(countryCode(t.countryCode)),
+      exact(name(t.name)),
+      exact(stateName(t.stateName)),
+      exact(provinceName(t.provinceName))
+      //exact(communityName(t.communityName))     // TODO: could this be because communityName is blank?
+    )
+
+    val locationFacet: FacetField = cityIndex.create.facet("locationFacet", hierarchical = true)
   }
 }
 
@@ -102,23 +256,34 @@ object GeoScala extends Logging {
   val LineRegex: Regex = """(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)""".r
 
   def main(args: Array[String]): Unit = {
-    val gs = new GeoScala(Paths.get("cache"))
-    val future = gs.updateCache()
-    Await.result(future, Duration.Inf)
+    val gs = new GeoScala()
+    Await.result(gs.future, Duration.Inf)
     logger.info("Finished!")
   }
 }
 
+case class PostalLocation(countryCode: String,
+                          postalCode: String,
+                          name: String,
+                          stateName: String,
+                          stateCode: String,
+                          provinceName: String,
+                          provinceCode: String,
+                          communityName: String,
+                          communityCode: String,
+                          point: SpatialPoint,
+                          accuracy: Int)
+
 case class Location(countryCode: String,
-                    postalCode: String,
                     name: String,
-                    state: LocationPart,
-                    province: LocationPart,
-                    community: LocationPart,
+                    stateName: String,
+                    stateCode: String,
+                    provinceName: String,
+                    provinceCode: String,
+                    communityName: String,
+                    communityCode: String,
                     point: SpatialPoint,
                     accuracy: Int)
-
-case class LocationPart(name: String, code: String)
 
 object UberZip extends Logging {
   def unzip(file: File, directory: File, threadCount: Int): Unit = {
