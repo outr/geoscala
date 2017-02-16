@@ -15,7 +15,6 @@ import com.outr.lucene4s.field.value.SpatialPoint
 import com.outr.lucene4s.keyword.KeywordIndexing
 import com.outr.lucene4s.mapper.Searchable
 import com.outr.lucene4s.query.{Condition, QueryBuilder, SearchTerm}
-import com.outr.scribe.Logging
 
 import scala.concurrent.{Await, Future}
 import scala.concurrent.ExecutionContext.Implicits.global
@@ -25,7 +24,7 @@ import scala.util.matching.Regex
 
 class GeoScala(cacheDirectory: Path = Paths.get("cache"),
                indexDirectory: Path = Paths.get("index"),
-               minimumUpdateAge: FiniteDuration = 30.days) extends Logging {
+               minimumUpdateAge: FiniteDuration = 30.days) {
   private val postalIndex = new Lucene(Some(indexDirectory.resolve("postal")), defaultFullTextSearchable = true)
   private val cityIndex = new Lucene(Some(indexDirectory.resolve("city")), defaultFullTextSearchable = true)
 
@@ -110,7 +109,7 @@ class GeoScala(cacheDirectory: Path = Paths.get("cache"),
       // Download latest GeoNames file if newer exists
       val expiredCache = cacheLastModified + minimumUpdateAge.toMillis < geoNamesLastModified
       if (expiredCache || force) {
-        logger.info(s"Modified Since Last Updated. GeoNames: $geoNamesLastModified, Cached: $cacheLastModified, Minimum Update Age: $minimumUpdateAge.")
+        scribe.info(s"Modified Since Last Updated. GeoNames: $geoNamesLastModified, Cached: $cacheLastModified, Minimum Update Age: $minimumUpdateAge.")
         val input = GeoScala.AllCountriesURL.openStream()
         try {
           Files.copy(input, cacheZIP, StandardCopyOption.REPLACE_EXISTING)
@@ -120,16 +119,16 @@ class GeoScala(cacheDirectory: Path = Paths.get("cache"),
         }
 
         // Extract GeoNames ZIP
-        logger.info(s"Extracting $cacheZIP...")
+        scribe.info(s"Extracting $cacheZIP...")
         UberZip.unzip(cacheZIP.toFile, cacheDirectory.toFile, 8)
 
         // Clear index
-        logger.info("Removing all records before importing...")
+        scribe.info("Removing all records before importing...")
         postalIndex.deleteAll()
         cityIndex.deleteAll()
 
         // Import and update index
-        logger.info("Importing lines from allCountries.txt...")
+        scribe.info("Importing lines from allCountries.txt...")
         val cacheText = cacheDirectory.resolve("allCountries.txt")
         val lineCount = {
           val stream = Files.lines(cacheText)
@@ -143,13 +142,13 @@ class GeoScala(cacheDirectory: Path = Paths.get("cache"),
         var lastLog = System.currentTimeMillis()
         lines.parallel().iterator().asScala.zipWithIndex.foreach {
           case (line@GeoScala.LineRegex(cc, pc, pn, an1, ac1, an2, ac2, an3, ac3, lat, lon, acc), index) => try {
-            logger.debug(s"cc: $cc, pc: $pc, pn: $pn, an1: $an1, an2: $an2, an3: $an3, lat: $lat, lon: $lon, acc: $acc")
+            scribe.debug(s"cc: $cc, pc: $pc, pn: $pn, an1: $an1, an2: $an2, an3: $an3, lat: $lat, lon: $lon, acc: $acc")
             val l = SpatialPoint(lat.toDouble, lon.toDouble)
             val locationPath = List(cc, an3, an2, an1, pn).filterNot(_.isEmpty)
 
             val time = System.currentTimeMillis()
             if (lastLog + 5000L < time) {
-              logger.info(s"Processing $index of $lineCount")
+              scribe.info(s"Processing $index of $lineCount")
               lastLog = time
             }
 
@@ -196,15 +195,15 @@ class GeoScala(cacheDirectory: Path = Paths.get("cache"),
         lines.close()
 
         // Commit the index changes
-        logger.info("Committing changes...")
+        scribe.info("Committing changes...")
         postalIndex.commit()
         cityIndex.commit()
 
         // Delete the TXT file
-        logger.info("Deleting allCountries.txt...")
+        scribe.info("Deleting allCountries.txt...")
         Files.delete(cacheText)
 
-        logger.info("Update complete")
+        scribe.info("Update complete")
       }
     }
 
@@ -251,14 +250,14 @@ class GeoScala(cacheDirectory: Path = Paths.get("cache"),
   }
 }
 
-object GeoScala extends Logging {
+object GeoScala {
   val AllCountriesURL = new URL("http://download.geonames.org/export/zip/allCountries.zip")
   val LineRegex: Regex = """(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)\t(.*)""".r
 
   def main(args: Array[String]): Unit = {
     val gs = new GeoScala()
     Await.result(gs.future, Duration.Inf)
-    logger.info("Finished!")
+    scribe.info("Finished!")
   }
 }
 
@@ -285,7 +284,7 @@ case class Location(countryCode: String,
                     point: SpatialPoint,
                     accuracy: Int)
 
-object UberZip extends Logging {
+object UberZip {
   def unzip(file: File, directory: File, threadCount: Int): Unit = {
     directory.mkdirs()
 
@@ -298,7 +297,7 @@ object UberZip extends Logging {
         try {
           UberZip.unzip(zip, entry, directory)
         } catch {
-          case t: Throwable => logger.error(t)
+          case t: Throwable => scribe.error(t)
         }
         counter.decrementAndGet()
       }
