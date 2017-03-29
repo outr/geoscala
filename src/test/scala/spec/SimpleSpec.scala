@@ -1,8 +1,6 @@
 package spec
 
 import com.outr.geoscala.GeoScala
-import com.outr.lucene4s._
-import com.outr.lucene4s.query.Condition
 import org.scalatest.{Matchers, WordSpec}
 
 import scala.concurrent.Await
@@ -16,8 +14,8 @@ class SimpleSpec extends WordSpec with Matchers {
       Await.result(geoScala.future, Duration.Inf)
     }
     "validate the proper database size" in {
-      geoScala.postalLocation.query().limit(1).search().total should be(1232664)
-      geoScala.location.query().limit(1).search().total should be(889968)
+      geoScala.postalLocation.query().limit(1).search().total should be(1236266)
+      geoScala.location.query().limit(1).search().total should be(892730)
     }
     "find one result for a ZIP code" in {
       val page = geoScala.search.postal("73072", countryCode = Some("US")).search()
