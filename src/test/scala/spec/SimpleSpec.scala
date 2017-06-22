@@ -14,8 +14,8 @@ class SimpleSpec extends WordSpec with Matchers {
       Await.result(geoScala.future, Duration.Inf)
     }
     "validate the proper database size" in {
-      geoScala.postalLocation.query().limit(1).search().total should be(1236266)
-      geoScala.location.query().limit(1).search().total should be(892730)
+      geoScala.postalLocation.query().limit(1).search().total shouldBe >(1000000)
+      geoScala.location.query().limit(1).search().total shouldBe >(800000)
     }
     "find one result for a ZIP code" in {
       val page = geoScala.search.postal("73072", countryCode = Some("US")).search()

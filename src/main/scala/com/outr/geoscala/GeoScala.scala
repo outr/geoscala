@@ -93,7 +93,7 @@ class GeoScala(cacheDirectory: Path = Paths.get("cache"),
       }
 
       // Determine currently cached date
-      val cacheZIP = cacheDirectory.resolve("allCountries.zip")
+      val cacheZIP: Path = cacheDirectory.resolve("allCountries.zip")
       val cacheLastModified = if (Files.exists(cacheZIP)) Files.getLastModifiedTime(cacheZIP).toMillis else 0L
 
       // Determine if there is a newer file available
@@ -142,54 +142,60 @@ class GeoScala(cacheDirectory: Path = Paths.get("cache"),
         var lastLog = System.currentTimeMillis()
         lines.parallel().iterator().asScala.zipWithIndex.foreach {
           case (line@GeoScala.LineRegex(cc, pc, pn, an1, ac1, an2, ac2, an3, ac3, lat, lon, acc), index) => try {
-            scribe.debug(s"cc: $cc, pc: $pc, pn: $pn, an1: $an1, an2: $an2, an3: $an3, lat: $lat, lon: $lon, acc: $acc")
-            val l = SpatialPoint(lat.toDouble, lon.toDouble)
-            val locationPath = List(cc, an3, an2, an1, pn).filterNot(_.isEmpty)
+            if (lat.isEmpty || lon.isEmpty) {
+              scribe.warn(s"Latitude or Longitude is blank for: cc: $cc, pc: $pc, pn: $pn, an1: $an1, an2: $an2, an3: $an3, lat: $lat, lon: $lon, acc: $acc (line: $line). Skipping!")
+            } else {
+              val l = SpatialPoint(lat.toDouble, lon.toDouble)
+              val locationPath = List(cc, an3, an2, an1, pn).filterNot(_.isEmpty)
 
-            val time = System.currentTimeMillis()
-            if (lastLog + 5000L < time) {
-              scribe.info(s"Processing $index of $lineCount")
-              lastLog = time
+              val time = System.currentTimeMillis()
+              if (lastLog + 5000L < time) {
+                scribe.info(s"Processing $index of $lineCount")
+                lastLog = time
+              }
+
+              // Postal index
+              val pl = PostalLocation(
+                countryCode = cc,
+                postalCode = pc,
+                name = pn,
+                stateName = an1,
+                stateCode = ac1,
+                provinceName = an2,
+                provinceCode = ac2,
+                communityName = an3,
+                communityCode = ac3,
+                point = l,
+                accuracy = if (acc.nonEmpty) acc.toInt else 0
+              )
+              postalLocation
+                .insert(pl)
+                .facets(postalLocation.locationFacet(locationPath: _*))
+                .index()
+
+              // Name index
+              val cl = Location(
+                countryCode = cc,
+                name = pn,
+                stateName = an1,
+                stateCode = ac1,
+                provinceName = an2,
+                provinceCode = ac2,
+                communityName = an3,
+                communityCode = ac3,
+                point = l,
+                accuracy = if (acc.nonEmpty) acc.toInt else 0
+              )
+              location
+                .update(cl)
+                .facets(location.locationFacet(locationPath: _*))
+                .index()
             }
-
-            // Postal index
-            val pl = PostalLocation(
-              countryCode = cc,
-              postalCode = pc,
-              name = pn,
-              stateName = an1,
-              stateCode = ac1,
-              provinceName = an2,
-              provinceCode = ac2,
-              communityName = an3,
-              communityCode = ac3,
-              point = l,
-              accuracy = if (acc.nonEmpty) acc.toInt else 0
-            )
-            postalLocation
-              .insert(pl)
-              .facets(postalLocation.locationFacet(locationPath: _*))
-              .index()
-
-            // Name index
-            val cl = Location(
-              countryCode = cc,
-              name = pn,
-              stateName = an1,
-              stateCode = ac1,
-              provinceName = an2,
-              provinceCode = ac2,
-              communityName = an3,
-              communityCode = ac3,
-              point = l,
-              accuracy = if (acc.nonEmpty) acc.toInt else 0
-            )
-            location
-              .update(cl)
-              .facets(location.locationFacet(locationPath: _*))
-              .index()
           } catch {
-            case t: Throwable => throw new RuntimeException(s"Failed to process line: $line! (lat: $lat, lon: $lon)", t)
+            case t: Throwable => {
+              Files.delete(cacheZIP)
+              throw new RuntimeException(s"Failed to process line: [$line] (cc: $cc, pc: $pc, pn: $pn, an1: $an1, an2: $an2, an3: $an3, lat: $lat, lon: $lon, acc: $acc)", t)
+            }
           }
         }
         lines.close()
