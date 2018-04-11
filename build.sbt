@@ -1,6 +1,6 @@
 name := "geoscala"
 organization := "com.outr"
-version := "1.0.7-SNAPSHOT"
+version := "1.0.7"
 scalaVersion := "2.12.5"
 crossScalaVersions := List("2.12.5", "2.11.12")
 parallelExecution in Test := false
